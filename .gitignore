@@ -1,0 +1,18 @@
+# Python
+venv/
+__pycache__/
+*.py[cod]
+
+# Environment variables
+.env
+.env.*
+
+# React / Vite
+frontend/node_modules/
+frontend/dist/
+
+# VS Code
+.vscode/
+
+# Generated podcast audio
+audio/generated/
