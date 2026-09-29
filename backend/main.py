@@ -1,9 +1,10 @@
 from pathlib import Path
 import traceback
-
+import time
+import os
 from fastapi import FastAPI, Depends, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response
+from fastapi.responses import Response, RedirectResponse
 from sqlalchemy.orm import Session, defer
 from sqlalchemy import text
 
@@ -24,6 +25,16 @@ from backend.agents.guest_agent import generate_guest_dialogue
 from backend.agents.reviewer_agent import generate_final_script
 from backend.agents.audio_agent import generate_podcast_audio
 
+
+import cloudinary
+import cloudinary.uploader
+
+cloudinary.config(
+    cloud_name=os.getenv("CLOUDINARY_CLOUD_NAME"),
+    api_key=os.getenv("CLOUDINARY_API_KEY"),
+    api_secret=os.getenv("CLOUDINARY_API_SECRET"),
+    secure=True,
+)
 
 app = FastAPI()
 
@@ -356,6 +367,24 @@ def get_audio_files(
 
 
 # ============================================================
+# CLOUDINARY AUDIO STORAGE
+# ============================================================
+
+
+def upload_audio_to_cloudinary(final_audio_path: Path):
+    """Upload the generated podcast audio to Cloudinary."""
+
+    result = cloudinary.uploader.upload(
+        str(final_audio_path),
+        resource_type="video",
+        public_id=f"podcast_{final_audio_path.stem}",
+        overwrite=True,
+    )
+
+    return result["secure_url"]
+
+
+# ============================================================
 # BACKGROUND GENERATION PIPELINE
 # ============================================================
 
@@ -530,52 +559,36 @@ def run_podcast_generation(podcast_id: int):
 
         # No DB session is held while Edge TTS + FFmpeg/pydub run.
         final_audio = generate_podcast_audio(final_script, podcast_id)
-        audio_bytes = final_audio.read_bytes()
-
-        import time
 
 # --------------------------------------------------------
-# STEP 8: SAVE AUDIO INFORMATION + AUDIO BYTES
-# --------------------------------------------------------
-        audio_saved = False
+        # STEP 8: UPLOAD AUDIO TO CLOUDINARY
+        # --------------------------------------------------------
+        cloudinary_url = upload_audio_to_cloudinary(final_audio)
 
-        for attempt in range(3):
-            try:
-                with SessionLocal() as db:
-            # Check whether the audio was already saved.
-                    existing_audio = (
-                        db.query(AudioFile)
-                        .filter(
-                        AudioFile.podcast_id == podcast_id,
-                        AudioFile.speaker == "combined",
-                    )
-                    .first()
+        with SessionLocal() as db:
+            existing_audio = (
+                db.query(AudioFile)
+                .filter(
+                    AudioFile.podcast_id == podcast_id,
+                    AudioFile.speaker == "combined",
                 )
+                .first()
+            )
 
-                if not existing_audio:
-                    db.add(
+            if existing_audio:
+                existing_audio.file_url = cloudinary_url
+                existing_audio.audio_data = None
+            else:
+                db.add(
                     AudioFile(
                         podcast_id=podcast_id,
                         speaker="combined",
-                        file_url=str(final_audio),
-                        audio_data=audio_bytes,
+                        file_url=cloudinary_url,
+                        audio_data=None,
                     )
                 )
-                db.commit()
 
-                audio_saved = True
-                break
-
-            except Exception as audio_error:
-                print(
-                    f"Audio database save attempt {attempt + 1}/3 failed: "
-                    f"{audio_error}"
-                )
-
-            if attempt < 2:
-                time.sleep(5)
-            else:
-                raise
+            db.commit()
         # --------------------------------------------------------
         # GENERATION COMPLETED
         # --------------------------------------------------------
@@ -741,7 +754,14 @@ def get_podcast_audio(
     if not audio:
         return {"error": "Audio not found"}
 
-    # Preferred path: persistent PostgreSQL copy.
+    # New Cloudinary-based audio files.
+    if audio.file_url and audio.file_url.startswith("http"):
+        return RedirectResponse(
+            url=audio.file_url,
+            status_code=307,
+        )
+
+    # Backward-compatible fallback for older records.
     if audio.audio_data:
         return Response(
             content=audio.audio_data,
@@ -753,13 +773,9 @@ def get_podcast_audio(
             },
         )
 
-    # Backward-compatible fallback for older records whose local file still
-    # exists. Persist the bytes before returning them.
     audio_path = Path(audio.file_url)
     if audio_path.exists():
         audio_bytes = audio_path.read_bytes()
-        audio.audio_data = audio_bytes
-        db.commit()
 
         return Response(
             content=audio_bytes,
