@@ -1,14 +1,13 @@
 from pathlib import Path
-import time
 import traceback
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Depends, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response, JSONResponse
+from fastapi.responses import Response
+from sqlalchemy.orm import Session, defer
 from sqlalchemy import text
-from sqlalchemy.exc import OperationalError
 
-from backend.database import SessionLocal
+from backend.database import SessionLocal, engine
 from backend.models import Podcast, Research, Outline, Script, AudioFile
 from backend.schemas import (
     PodcastCreate,
@@ -28,19 +27,6 @@ from backend.agents.audio_agent import generate_podcast_audio
 
 app = FastAPI()
 
-
-
-@app.exception_handler(OperationalError)
-async def database_error_handler(request: Request, exc: OperationalError):
-    """Return a clear 503 when PostgreSQL is temporarily unavailable."""
-    return JSONResponse(
-        status_code=503,
-        content={
-            "error": "Database temporarily unavailable. Please retry.",
-        },
-        headers={"Retry-After": "3"},
-    )
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -55,74 +41,37 @@ app.add_middleware(
 
 
 # ============================================================
-# POSTGRES RETRY HELPERS
-# ============================================================
-
-
-def db_retry(operation, attempts=3, base_delay=1.0, commit=False):
-    """Run one short DB operation with retries for transient PostgreSQL errors."""
-    last_error = None
-
-    for attempt in range(1, attempts + 1):
-        db = SessionLocal()
-        try:
-            result = operation(db)
-
-            if commit:
-                db.commit()
-            else:
-                # End any read transaction cleanly before returning the connection.
-                db.rollback()
-
-            return result
-
-        except OperationalError as exc:
-            last_error = exc
-
-            try:
-                db.rollback()
-            except Exception:
-                pass
-
-            if attempt < attempts:
-                wait_time = base_delay * attempt
-                print(
-                    f"PostgreSQL operation failed (attempt {attempt}/{attempts}): {exc}"
-                )
-                print(f"Retrying database operation in {wait_time:.0f} seconds...")
-                time.sleep(wait_time)
-
-        finally:
-            try:
-                db.close()
-            except Exception:
-                pass
-
-    raise last_error
-
-
-# ============================================================
 # PERSISTENT AUDIO STORAGE
 # ============================================================
 
 
 def ensure_audio_data_column():
-    """Ensure the persistent audio column exists on the existing DB."""
-
-    def operation(db):
-        db.execute(
+    """Add persistent audio storage to existing PostgreSQL databases."""
+    with engine.begin() as connection:
+        connection.execute(
             text(
                 "ALTER TABLE audio_files "
                 "ADD COLUMN IF NOT EXISTS audio_data BYTEA"
             )
         )
 
-    db_retry(operation, commit=True)
-
 
 @app.on_event("startup")
 def startup_audio_storage():
     ensure_audio_data_column()
+
+
+# ============================================================
+# DATABASE DEPENDENCY
+# ============================================================
+
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
 
 
 # ============================================================
@@ -137,11 +86,12 @@ def root():
 
 @app.get("/test-db")
 def test_db():
-    def operation(db):
-        return db.execute(text("SELECT 1")).scalar()
-
-    result = db_retry(operation)
-    return {"database": "connected", "result": result}
+    with SessionLocal() as db:
+        result = db.execute(text("SELECT 1"))
+        return {
+            "database": "connected",
+            "result": result.scalar(),
+        }
 
 
 # ============================================================
@@ -150,168 +100,150 @@ def test_db():
 
 
 @app.post("/podcasts")
-def create_podcast(podcast: PodcastCreate):
-    def operation(db):
-        new_podcast = Podcast(
-            user_id=podcast.user_id,
-            title=podcast.title,
-            topic=podcast.topic,
-            duration=podcast.duration,
-            language=podcast.language,
-            speakers=podcast.speakers,
-            status=podcast.status,
-        )
-        db.add(new_podcast)
-        db.flush()
-        return new_podcast.id
+def create_podcast(
+    podcast: PodcastCreate,
+    db: Session = Depends(get_db),
+):
+    new_podcast = Podcast(
+        user_id=podcast.user_id,
+        title=podcast.title,
+        topic=podcast.topic,
+        duration=podcast.duration,
+        language=podcast.language,
+        speakers=podcast.speakers,
+        status=podcast.status,
+    )
 
-    podcast_id = db_retry(operation, commit=True)
+    db.add(new_podcast)
+    db.commit()
+    db.refresh(new_podcast)
+
     return {
         "message": "Podcast created successfully",
-        "podcast_id": podcast_id,
+        "podcast_id": new_podcast.id,
     }
 
 
 @app.get("/podcasts")
-def get_podcasts():
-    def operation(db):
-        podcasts = db.query(Podcast).order_by(Podcast.id.desc()).all()
-        return [
-            {
-                "id": podcast.id,
-                "user_id": podcast.user_id,
-                "title": podcast.title,
-                "topic": podcast.topic,
-                "duration": podcast.duration,
-                "language": podcast.language,
-                "speakers": podcast.speakers,
-                "status": podcast.status,
-                "current_step": podcast.current_step,
-                "created_at": podcast.created_at,
-                "updated_at": podcast.updated_at,
-            }
-            for podcast in podcasts
-        ]
-
-    return db_retry(operation)
+def get_podcasts(db: Session = Depends(get_db)):
+    return db.query(Podcast).all()
 
 
 @app.get("/podcasts/{podcast_id}/status")
-def get_podcast_status(podcast_id: int):
-    def operation(db):
-        podcast = (
-            db.query(Podcast)
-            .filter(Podcast.id == podcast_id)
-            .first()
-        )
+def get_podcast_status(
+    podcast_id: int,
+    db: Session = Depends(get_db),
+):
+    podcast = (
+        db.query(Podcast)
+        .filter(Podcast.id == podcast_id)
+        .first()
+    )
 
-        if not podcast:
-            return None
-
-        return {
-            "podcast_id": podcast.id,
-            "title": podcast.title,
-            "status": podcast.status,
-            "current_step": podcast.current_step,
-        }
-
-    result = db_retry(operation)
-
-    if result is None:
+    if not podcast:
         return {"error": "Podcast not found"}
 
-    return result
+    return {
+        "podcast_id": podcast.id,
+        "title": podcast.title,
+        "status": podcast.status,
+        "current_step": podcast.current_step,
+    }
 
 
 @app.get("/podcasts/{podcast_id}")
-def get_podcast_details(podcast_id: int):
-    def operation(db):
-        podcast = (
-            db.query(Podcast)
-            .filter(Podcast.id == podcast_id)
-            .first()
-        )
+def get_podcast_details(
+    podcast_id: int,
+    db: Session = Depends(get_db),
+):
+    podcast = (
+        db.query(Podcast)
+        .filter(Podcast.id == podcast_id)
+        .first()
+    )
 
-        if not podcast:
-            return None
-
-        research = (
-            db.query(Research)
-            .filter(Research.podcast_id == podcast_id)
-            .order_by(Research.id.desc())
-            .first()
-        )
-
-        outline = (
-            db.query(Outline)
-            .filter(Outline.podcast_id == podcast_id)
-            .order_by(Outline.id.desc())
-            .first()
-        )
-
-        script = (
-            db.query(Script)
-            .filter(Script.podcast_id == podcast_id)
-            .order_by(Script.id.desc())
-            .first()
-        )
-
-        audio = (
-            db.query(AudioFile)
-            .filter(
-                AudioFile.podcast_id == podcast_id,
-                AudioFile.speaker == "combined",
-            )
-            .order_by(AudioFile.id.desc())
-            .first()
-        )
-
-        # Migrate older records if the original local file still exists.
-        if audio and not audio.audio_data:
-            audio_path = Path(audio.file_url)
-            if audio_path.exists():
-                audio.audio_data = audio_path.read_bytes()
-                db.commit()
-
-        return {
-            "podcast": {
-                "id": podcast.id,
-                "title": podcast.title,
-                "topic": podcast.topic,
-                "duration": podcast.duration,
-                "language": podcast.language,
-                "speakers": podcast.speakers,
-                "status": podcast.status,
-                "current_step": podcast.current_step,
-            },
-            "research": (
-                {"id": research.id, "content": research.content}
-                if research
-                else None
-            ),
-            "outline": (
-                {"id": outline.id, "content": outline.content}
-                if outline
-                else None
-            ),
-            "script": (
-                {"id": script.id, "content": script.content}
-                if script
-                else None
-            ),
-            "audio": (
-                {"id": audio.id, "url": f"/audio/{podcast.id}"}
-                if audio
-                else None
-            ),
-        }
-
-    result = db_retry(operation)
-
-    if result is None:
+    if not podcast:
         return {"error": "Podcast not found"}
 
-    return result
+    research = (
+        db.query(Research)
+        .filter(Research.podcast_id == podcast_id)
+        .order_by(Research.id.desc())
+        .first()
+    )
+
+    outline = (
+        db.query(Outline)
+        .filter(Outline.podcast_id == podcast_id)
+        .order_by(Outline.id.desc())
+        .first()
+    )
+
+    script = (
+        db.query(Script)
+        .filter(Script.podcast_id == podcast_id)
+        .order_by(Script.id.desc())
+        .first()
+    )
+
+    # Do not load the potentially large audio_data column when the details
+    # endpoint is only returning metadata. The /audio endpoint loads it when
+    # the browser actually requests the audio stream.
+    audio = (
+        db.query(AudioFile)
+        .options(defer(AudioFile.audio_data))
+        .filter(
+            AudioFile.podcast_id == podcast_id,
+            AudioFile.speaker == "combined",
+        )
+        .order_by(AudioFile.id.desc())
+        .first()
+    )
+
+    # Persist older audio records when the original local file still exists.
+    # Accessing audio.audio_data here triggers a deferred query only for this
+    # legacy-record migration path.
+    if audio and not audio.audio_data:
+        audio_path = Path(audio.file_url)
+        if audio_path.exists():
+            audio.audio_data = audio_path.read_bytes()
+            db.commit()
+
+    return {
+        "podcast": {
+            "id": podcast.id,
+            "title": podcast.title,
+            "topic": podcast.topic,
+            "duration": podcast.duration,
+            "language": podcast.language,
+            "speakers": podcast.speakers,
+            "status": podcast.status,
+            "current_step": podcast.current_step,
+        },
+        "research": (
+            {"id": research.id, "content": research.content}
+            if research
+            else None
+        ),
+        "outline": (
+            {"id": outline.id, "content": outline.content}
+            if outline
+            else None
+        ),
+        "script": (
+            {"id": script.id, "content": script.content}
+            if script
+            else None
+        ),
+        "audio": (
+            {
+                "id": audio.id,
+                "url": f"/audio/{podcast.id}",
+            }
+            if audio
+            else None
+        ),
+    }
 
 
 # ============================================================
@@ -320,41 +252,34 @@ def get_podcast_details(podcast_id: int):
 
 
 @app.post("/research")
-def create_research(research: ResearchCreate):
-    def operation(db):
-        new_research = Research(
-            podcast_id=research.podcast_id,
-            content=research.content,
-        )
-        db.add(new_research)
-        db.flush()
-        return new_research.id
+def create_research(
+    research: ResearchCreate,
+    db: Session = Depends(get_db),
+):
+    new_research = Research(
+        podcast_id=research.podcast_id,
+        content=research.content,
+    )
+    db.add(new_research)
+    db.commit()
+    db.refresh(new_research)
 
-    research_id = db_retry(operation, commit=True)
     return {
         "message": "Research created successfully",
-        "research_id": research_id,
+        "research_id": new_research.id,
     }
 
 
 @app.get("/research/{podcast_id}")
-def get_research(podcast_id: int):
-    def operation(db):
-        research = (
-            db.query(Research)
-            .filter(Research.podcast_id == podcast_id)
-            .all()
-        )
-        return [
-            {
-                "id": item.id,
-                "podcast_id": item.podcast_id,
-                "content": item.content,
-            }
-            for item in research
-        ]
-
-    return db_retry(operation)
+def get_research(
+    podcast_id: int,
+    db: Session = Depends(get_db),
+):
+    return (
+        db.query(Research)
+        .filter(Research.podcast_id == podcast_id)
+        .all()
+    )
 
 
 # ============================================================
@@ -363,41 +288,34 @@ def get_research(podcast_id: int):
 
 
 @app.post("/scripts")
-def create_script(script: ScriptCreate):
-    def operation(db):
-        new_script = Script(
-            podcast_id=script.podcast_id,
-            content=script.content,
-        )
-        db.add(new_script)
-        db.flush()
-        return new_script.id
+def create_script(
+    script: ScriptCreate,
+    db: Session = Depends(get_db),
+):
+    new_script = Script(
+        podcast_id=script.podcast_id,
+        content=script.content,
+    )
+    db.add(new_script)
+    db.commit()
+    db.refresh(new_script)
 
-    script_id = db_retry(operation, commit=True)
     return {
         "message": "Script created successfully",
-        "script_id": script_id,
+        "script_id": new_script.id,
     }
 
 
 @app.get("/scripts/{podcast_id}")
-def get_scripts(podcast_id: int):
-    def operation(db):
-        scripts = (
-            db.query(Script)
-            .filter(Script.podcast_id == podcast_id)
-            .all()
-        )
-        return [
-            {
-                "id": item.id,
-                "podcast_id": item.podcast_id,
-                "content": item.content,
-            }
-            for item in scripts
-        ]
-
-    return db_retry(operation)
+def get_scripts(
+    podcast_id: int,
+    db: Session = Depends(get_db),
+):
+    return (
+        db.query(Script)
+        .filter(Script.podcast_id == podcast_id)
+        .all()
+    )
 
 
 # ============================================================
@@ -406,155 +324,35 @@ def get_scripts(podcast_id: int):
 
 
 @app.post("/audio-files")
-def create_audio_file(audio: AudioFileCreate):
-    def operation(db):
-        new_audio = AudioFile(
-            podcast_id=audio.podcast_id,
-            speaker=audio.speaker,
-            file_url=audio.file_url,
-        )
-        db.add(new_audio)
-        db.flush()
-        return new_audio.id
+def create_audio_file(
+    audio: AudioFileCreate,
+    db: Session = Depends(get_db),
+):
+    new_audio = AudioFile(
+        podcast_id=audio.podcast_id,
+        speaker=audio.speaker,
+        file_url=audio.file_url,
+    )
+    db.add(new_audio)
+    db.commit()
+    db.refresh(new_audio)
 
-    audio_file_id = db_retry(operation, commit=True)
     return {
         "message": "Audio file created successfully",
-        "audio_file_id": audio_file_id,
+        "audio_file_id": new_audio.id,
     }
 
 
 @app.get("/audio-files/{podcast_id}")
-def get_audio_files(podcast_id: int):
-    def operation(db):
-        audio_files = (
-            db.query(AudioFile)
-            .filter(AudioFile.podcast_id == podcast_id)
-            .all()
-        )
-        return [
-            {
-                "id": item.id,
-                "podcast_id": item.podcast_id,
-                "speaker": item.speaker,
-                "file_url": item.file_url,
-            }
-            for item in audio_files
-        ]
-
-    return db_retry(operation)
-
-
-# ============================================================
-# SMALL DATABASE UPDATE HELPERS
-# ============================================================
-
-
-def set_podcast_step(podcast_id: int, step: str):
-    def operation(db):
-        podcast = (
-            db.query(Podcast)
-            .filter(Podcast.id == podcast_id)
-            .first()
-        )
-        if not podcast:
-            raise ValueError(f"Podcast {podcast_id} not found")
-        podcast.status = "generating"
-        podcast.current_step = step
-
-    db_retry(operation, commit=True)
-
-
-def get_podcast_topic(podcast_id: int):
-    def operation(db):
-        podcast = (
-            db.query(Podcast)
-            .filter(Podcast.id == podcast_id)
-            .first()
-        )
-        if not podcast:
-            return None
-        return podcast.topic
-
-    return db_retry(operation)
-
-
-def get_existing_research(podcast_id: int):
-    def operation(db):
-        research = (
-            db.query(Research)
-            .filter(Research.podcast_id == podcast_id)
-            .order_by(Research.id.desc())
-            .first()
-        )
-        if not research:
-            return None
-        return research.content
-
-    return db_retry(operation)
-
-
-def save_research(podcast_id: int, content: str):
-    def operation(db):
-        db.add(Research(podcast_id=podcast_id, content=content))
-
-    db_retry(operation, commit=True)
-
-
-def save_outline(podcast_id: int, content: str):
-    def operation(db):
-        db.add(Outline(podcast_id=podcast_id, content=content))
-
-    db_retry(operation, commit=True)
-
-
-def save_script(podcast_id: int, content: str):
-    def operation(db):
-        db.add(Script(podcast_id=podcast_id, content=content))
-
-    db_retry(operation, commit=True)
-
-
-def save_audio(podcast_id: int, final_audio_path: Path, audio_bytes: bytes):
-    def operation(db):
-        db.add(
-            AudioFile(
-                podcast_id=podcast_id,
-                speaker="combined",
-                file_url=str(final_audio_path),
-                audio_data=audio_bytes,
-            )
-        )
-
-    db_retry(operation, commit=True)
-
-
-def mark_completed(podcast_id: int):
-    def operation(db):
-        podcast = (
-            db.query(Podcast)
-            .filter(Podcast.id == podcast_id)
-            .first()
-        )
-        if podcast:
-            podcast.status = "completed"
-            podcast.current_step = "completed"
-
-    db_retry(operation, commit=True)
-
-
-def mark_failed(podcast_id: int):
-    def operation(db):
-        podcast = (
-            db.query(Podcast)
-            .filter(Podcast.id == podcast_id)
-            .first()
-        )
-        if podcast:
-            podcast.status = "failed"
-            podcast.current_step = "failed"
-
-    db_retry(operation, commit=True)
+def get_audio_files(
+    podcast_id: int,
+    db: Session = Depends(get_db),
+):
+    return (
+        db.query(AudioFile)
+        .filter(AudioFile.podcast_id == podcast_id)
+        .all()
+    )
 
 
 # ============================================================
@@ -564,71 +362,204 @@ def mark_failed(podcast_id: int):
 
 def run_podcast_generation(podcast_id: int):
     """
-    Run the multi-agent pipeline without keeping any DB session alive
-    during Gemini, Edge-TTS, or FFmpeg work.
+    Run the full multi-agent generation pipeline.
+
+    Important: the database session is deliberately opened only for short
+    database operations. No DB session remains open while Gemini or Edge TTS
+    performs network/CPU work. This prevents stale PostgreSQL connections
+    during long-running generation jobs.
     """
+
     try:
         # --------------------------------------------------------
-        # START
+        # LOAD PODCAST + MARK GENERATING
         # --------------------------------------------------------
-        topic = get_podcast_topic(podcast_id)
-        if not topic:
-            print(f"Podcast {podcast_id} not found")
-            return
+        with SessionLocal() as db:
+            podcast = (
+                db.query(Podcast)
+                .filter(Podcast.id == podcast_id)
+                .first()
+            )
 
-        set_podcast_step(podcast_id, "researching")
+            if not podcast:
+                print(f"Podcast {podcast_id} not found")
+                return
+
+            topic = podcast.topic
+            podcast.status = "generating"
+            podcast.current_step = "researching"
+            db.commit()
 
         # --------------------------------------------------------
-        # STEP 1: RESEARCH
+        # STEP 1: RESEARCH AGENT
         # --------------------------------------------------------
-        research_content = get_existing_research(podcast_id)
+        with SessionLocal() as db:
+            existing_research = (
+                db.query(Research)
+                .filter(Research.podcast_id == podcast_id)
+                .order_by(Research.id.desc())
+                .first()
+            )
+            research_content = (
+                existing_research.content
+                if existing_research
+                else None
+            )
+
         if research_content is None:
+            # No DB session is held while Gemini is running.
             research_content = generate_research(topic)
-            save_research(podcast_id, research_content)
+
+            with SessionLocal() as db:
+                db.add(
+                    Research(
+                        podcast_id=podcast_id,
+                        content=research_content,
+                    )
+                )
+                db.commit()
 
         # --------------------------------------------------------
-        # STEP 2: OUTLINE
+        # STEP 2: PRODUCER AGENT
         # --------------------------------------------------------
-        set_podcast_step(podcast_id, "outlining")
+        with SessionLocal() as db:
+            podcast = (
+                db.query(Podcast)
+                .filter(Podcast.id == podcast_id)
+                .first()
+            )
+            if not podcast:
+                return
+            podcast.current_step = "outlining"
+            db.commit()
+            topic = podcast.topic
+
+        # No DB session while Gemini is running.
         outline_content = generate_outline(topic, research_content)
-        save_outline(podcast_id, outline_content)
+
+        with SessionLocal() as db:
+            db.add(
+                Outline(
+                    podcast_id=podcast_id,
+                    content=outline_content,
+                )
+            )
+            db.commit()
 
         # --------------------------------------------------------
-        # STEP 3: HOST
+        # STEP 3: HOST AGENT
         # --------------------------------------------------------
-        set_podcast_step(podcast_id, "writing_host")
+        with SessionLocal() as db:
+            podcast = (
+                db.query(Podcast)
+                .filter(Podcast.id == podcast_id)
+                .first()
+            )
+            if not podcast:
+                return
+            topic = podcast.topic
+            podcast.current_step = "writing_host"
+            db.commit()
+
         host_dialogue = generate_host_dialogue(topic, outline_content)
 
         # --------------------------------------------------------
-        # STEP 4: GUEST
+        # STEP 4: GUEST AGENT
         # --------------------------------------------------------
-        set_podcast_step(podcast_id, "writing_guest")
+        with SessionLocal() as db:
+            podcast = (
+                db.query(Podcast)
+                .filter(Podcast.id == podcast_id)
+                .first()
+            )
+            if not podcast:
+                return
+            topic = podcast.topic
+            podcast.current_step = "writing_guest"
+            db.commit()
+
         guest_dialogue = generate_guest_dialogue(topic, outline_content)
 
         # --------------------------------------------------------
-        # STEP 5: REVIEWER
+        # STEP 5: REVIEWER / DIRECTOR AGENT
         # --------------------------------------------------------
-        set_podcast_step(podcast_id, "reviewing")
+        with SessionLocal() as db:
+            podcast = (
+                db.query(Podcast)
+                .filter(Podcast.id == podcast_id)
+                .first()
+            )
+            if not podcast:
+                return
+            topic = podcast.topic
+            podcast.current_step = "reviewing"
+            db.commit()
+
         final_script = generate_final_script(
             topic,
             outline_content,
             host_dialogue,
             guest_dialogue,
         )
-        save_script(podcast_id, final_script)
 
         # --------------------------------------------------------
-        # STEP 6: AUDIO
+        # STEP 6: SAVE FINAL SCRIPT
         # --------------------------------------------------------
-        set_podcast_step(podcast_id, "generating_audio")
+        with SessionLocal() as db:
+            db.add(
+                Script(
+                    podcast_id=podcast_id,
+                    content=final_script,
+                )
+            )
+            db.commit()
+
+        # --------------------------------------------------------
+        # STEP 7: GENERATE AUDIO
+        # --------------------------------------------------------
+        with SessionLocal() as db:
+            podcast = (
+                db.query(Podcast)
+                .filter(Podcast.id == podcast_id)
+                .first()
+            )
+            if not podcast:
+                return
+            podcast.current_step = "generating_audio"
+            db.commit()
+
+        # No DB session is held while Edge TTS + FFmpeg/pydub run.
         final_audio = generate_podcast_audio(final_script, podcast_id)
         audio_bytes = final_audio.read_bytes()
-        save_audio(podcast_id, final_audio, audio_bytes)
 
         # --------------------------------------------------------
-        # COMPLETE
+        # STEP 8: SAVE AUDIO INFORMATION + AUDIO BYTES
         # --------------------------------------------------------
-        mark_completed(podcast_id)
+        with SessionLocal() as db:
+            db.add(
+                AudioFile(
+                    podcast_id=podcast_id,
+                    speaker="combined",
+                    file_url=str(final_audio),
+                    audio_data=audio_bytes,
+                )
+            )
+            db.commit()
+
+        # --------------------------------------------------------
+        # GENERATION COMPLETED
+        # --------------------------------------------------------
+        with SessionLocal() as db:
+            podcast = (
+                db.query(Podcast)
+                .filter(Podcast.id == podcast_id)
+                .first()
+            )
+            if podcast:
+                podcast.status = "completed"
+                podcast.current_step = "completed"
+                db.commit()
+
         print(f"Podcast {podcast_id} generated successfully.")
 
     except Exception as exc:
@@ -640,8 +571,18 @@ def run_podcast_generation(podcast_id: int):
         traceback.print_exc()
         print("========================================\n")
 
+        # Use a fresh database session to record the failure.
         try:
-            mark_failed(podcast_id)
+            with SessionLocal() as db:
+                podcast = (
+                    db.query(Podcast)
+                    .filter(Podcast.id == podcast_id)
+                    .first()
+                )
+                if podcast:
+                    podcast.status = "failed"
+                    podcast.current_step = "failed"
+                    db.commit()
         except Exception as failure_update_error:
             print(
                 "Failed to update podcast failure status: "
@@ -650,101 +591,101 @@ def run_podcast_generation(podcast_id: int):
 
 
 # ============================================================
-# GENERATION ROUTES
+# COMPLETE PODCAST GENERATION PIPELINE
 # ============================================================
 
 
 @app.post("/generate-podcast")
 def generate_podcast(
     request: PodcastGenerationRequest,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
 ):
-    def operation(db):
-        podcast = (
-            db.query(Podcast)
-            .filter(Podcast.id == request.podcast_id)
-            .first()
-        )
-        if not podcast:
-            return None
+    podcast = (
+        db.query(Podcast)
+        .filter(Podcast.id == request.podcast_id)
+        .first()
+    )
 
-        if podcast.status == "generating":
-            return {
-                "message": "Podcast generation is already in progress",
-                "podcast_id": podcast.id,
-                "status": "generating",
-                "current_step": podcast.current_step,
-                "queue": False,
-            }
-
-        if podcast.status == "completed":
-            return {
-                "message": "Podcast has already been generated",
-                "podcast_id": podcast.id,
-                "status": "completed",
-                "current_step": podcast.current_step,
-                "queue": False,
-            }
-
-        podcast.status = "generating"
-        podcast.current_step = "researching"
-        return {
-            "message": "Podcast generation started",
-            "podcast_id": podcast.id,
-            "status": "generating",
-            "current_step": "researching",
-            "queue": True,
-        }
-
-    result = db_retry(operation, commit=True)
-
-    if result is None:
+    if not podcast:
         return {"error": "Podcast not found"}
 
-    # The Render background worker picks up podcasts with
-    # status="generating" from PostgreSQL.
-    return result
+    if podcast.status == "generating":
+        return {
+            "message": "Podcast generation is already in progress",
+            "podcast_id": podcast.id,
+            "status": "generating",
+            "current_step": podcast.current_step,
+        }
+
+    if podcast.status == "completed":
+        return {
+            "message": "Podcast has already been generated",
+            "podcast_id": podcast.id,
+            "status": "completed",
+            "current_step": podcast.current_step,
+        }
+
+    podcast.status = "generating"
+    podcast.current_step = "researching"
+    db.commit()
+
+    background_tasks.add_task(
+        run_podcast_generation,
+        podcast.id,
+    )
+
+    return {
+        "message": "Podcast generation started",
+        "podcast_id": podcast.id,
+        "status": "generating",
+        "current_step": "researching",
+    }
+
+
+# ============================================================
+# REGENERATE PODCAST
+# ============================================================
 
 
 @app.post("/podcasts/{podcast_id}/regenerate")
 def regenerate_podcast(
     podcast_id: int,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
 ):
-    def operation(db):
-        podcast = (
-            db.query(Podcast)
-            .filter(Podcast.id == podcast_id)
-            .first()
-        )
-        if not podcast:
-            return None
+    podcast = (
+        db.query(Podcast)
+        .filter(Podcast.id == podcast_id)
+        .first()
+    )
 
-        if podcast.status == "generating":
-            return {
-                "message": "Podcast generation is already in progress",
-                "podcast_id": podcast.id,
-                "status": "generating",
-                "current_step": podcast.current_step,
-                "queue": False,
-            }
-
-        podcast.status = "generating"
-        podcast.current_step = "researching"
-        return {
-            "message": "Podcast regeneration started",
-            "podcast_id": podcast.id,
-            "status": "generating",
-            "current_step": "researching",
-            "queue": True,
-        }
-
-    result = db_retry(operation, commit=True)
-
-    if result is None:
+    if not podcast:
         return {"error": "Podcast not found"}
 
-    # The Render background worker picks up podcasts with
-    # status="generating" from PostgreSQL.
-    return result
+    if podcast.status == "generating":
+        return {
+            "message": "Podcast generation is already in progress",
+            "podcast_id": podcast.id,
+            "status": "generating",
+            "current_step": podcast.current_step,
+        }
+
+    podcast.status = "generating"
+    podcast.current_step = "researching"
+    db.commit()
+
+    background_tasks.add_task(
+        run_podcast_generation,
+        podcast.id,
+    )
+
+    return {
+        "message": "Podcast regeneration started",
+        "podcast_id": podcast.id,
+        "status": "generating",
+        "current_step": "researching",
+    }
 
 
 # ============================================================
@@ -753,58 +694,56 @@ def regenerate_podcast(
 
 
 @app.get("/audio/{podcast_id}")
-def get_podcast_audio(podcast_id: int):
-    def operation(db):
-        audio = (
-            db.query(AudioFile)
-            .filter(
-                AudioFile.podcast_id == podcast_id,
-                AudioFile.speaker == "combined",
-            )
-            .order_by(AudioFile.id.desc())
-            .first()
+def get_podcast_audio(
+    podcast_id: int,
+    db: Session = Depends(get_db),
+):
+    audio = (
+        db.query(AudioFile)
+        .filter(
+            AudioFile.podcast_id == podcast_id,
+            AudioFile.speaker == "combined",
         )
+        .order_by(AudioFile.id.desc())
+        .first()
+    )
 
-        if not audio:
-            return None
-
-        if audio.audio_data:
-            return {
-                "data": audio.audio_data,
-                "filename": f"podcast_{podcast_id}_final.wav",
-            }
-
-        audio_path = Path(audio.file_url)
-        if audio_path.exists():
-            audio_bytes = audio_path.read_bytes()
-            audio.audio_data = audio_bytes
-            db.commit()
-            return {
-                "data": audio_bytes,
-                "filename": audio_path.name,
-            }
-
-        return "missing"
-
-    result = db_retry(operation)
-
-    if result is None:
+    if not audio:
         return {"error": "Audio not found"}
 
-    if result == "missing":
-        return {
-            "error": "Audio file is not available. Please regenerate this podcast once."
-        }
+    # Preferred path: persistent PostgreSQL copy.
+    if audio.audio_data:
+        return Response(
+            content=audio.audio_data,
+            media_type="audio/wav",
+            headers={
+                "Content-Disposition": (
+                    f'inline; filename="podcast_{podcast_id}_final.wav"'
+                )
+            },
+        )
 
-    return Response(
-        content=result["data"],
-        media_type="audio/wav",
-        headers={
-            "Content-Disposition": (
-                f'inline; filename="{result["filename"]}"'
-            )
-        },
-    )
+    # Backward-compatible fallback for older records whose local file still
+    # exists. Persist the bytes before returning them.
+    audio_path = Path(audio.file_url)
+    if audio_path.exists():
+        audio_bytes = audio_path.read_bytes()
+        audio.audio_data = audio_bytes
+        db.commit()
+
+        return Response(
+            content=audio_bytes,
+            media_type="audio/wav",
+            headers={
+                "Content-Disposition": (
+                    f'inline; filename="{audio_path.name}"'
+                )
+            },
+        )
+
+    return {
+        "error": "Audio file is not available. Please regenerate this podcast once."
+    }
 
 
 # ============================================================
@@ -813,39 +752,37 @@ def get_podcast_audio(podcast_id: int):
 
 
 @app.delete("/podcasts/{podcast_id}")
-def delete_podcast(podcast_id: int):
-    def operation(db):
-        podcast = (
-            db.query(Podcast)
-            .filter(Podcast.id == podcast_id)
-            .first()
-        )
-        if not podcast:
-            return False
+def delete_podcast(
+    podcast_id: int,
+    db: Session = Depends(get_db),
+):
+    podcast = (
+        db.query(Podcast)
+        .filter(Podcast.id == podcast_id)
+        .first()
+    )
 
-        db.query(Research).filter(
-            Research.podcast_id == podcast_id
-        ).delete(synchronize_session=False)
-
-        db.query(Outline).filter(
-            Outline.podcast_id == podcast_id
-        ).delete(synchronize_session=False)
-
-        db.query(Script).filter(
-            Script.podcast_id == podcast_id
-        ).delete(synchronize_session=False)
-
-        db.query(AudioFile).filter(
-            AudioFile.podcast_id == podcast_id
-        ).delete(synchronize_session=False)
-
-        db.delete(podcast)
-        return True
-
-    deleted = db_retry(operation, commit=True)
-
-    if not deleted:
+    if not podcast:
         return {"error": "Podcast not found"}
+
+    db.query(Research).filter(
+        Research.podcast_id == podcast_id
+    ).delete(synchronize_session=False)
+
+    db.query(Outline).filter(
+        Outline.podcast_id == podcast_id
+    ).delete(synchronize_session=False)
+
+    db.query(Script).filter(
+        Script.podcast_id == podcast_id
+    ).delete(synchronize_session=False)
+
+    db.query(AudioFile).filter(
+        AudioFile.podcast_id == podcast_id
+    ).delete(synchronize_session=False)
+
+    db.delete(podcast)
+    db.commit()
 
     return {
         "message": "Podcast deleted successfully",
