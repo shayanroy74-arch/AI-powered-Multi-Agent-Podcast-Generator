@@ -2,7 +2,7 @@ from pathlib import Path
 import traceback
 from fastapi import FastAPI, Depends, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import Response
 from sqlalchemy.orm import Session
 from sqlalchemy import text
 
@@ -36,6 +36,27 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ============================================================
+# PERSISTENT AUDIO STORAGE
+# ============================================================
+
+def ensure_audio_data_column():
+    """Add persistent audio storage to existing PostgreSQL databases."""
+    with SessionLocal() as db:
+        db.execute(
+            text(
+                "ALTER TABLE audio_files "
+                "ADD COLUMN IF NOT EXISTS audio_data BYTEA"
+            )
+        )
+        db.commit()
+
+
+@app.on_event("startup")
+def startup_audio_storage():
+    ensure_audio_data_column()
+
 
 # ============================================================
 # DATABASE DEPENDENCY
@@ -192,6 +213,14 @@ def get_podcast_details(
         .order_by(AudioFile.id.desc())
         .first()
     )
+
+    # Persist older audio files if they still exist on the local filesystem.
+    # This upgrades records created before persistent audio storage was added.
+    if audio and not audio.audio_data:
+        audio_path = Path(audio.file_url)
+        if audio_path.exists():
+            audio.audio_data = audio_path.read_bytes()
+            db.commit()
 
     return {
         "podcast": {
@@ -514,10 +543,15 @@ def run_podcast_generation(podcast_id: int):
         # STEP 8: SAVE AUDIO INFORMATION
         # --------------------------------------------------------
 
+        # Persist the final audio in PostgreSQL. Render's local filesystem
+        # is ephemeral, so the database copy survives instance restarts.
+        audio_bytes = final_audio.read_bytes()
+
         new_audio = AudioFile(
             podcast_id=podcast.id,
             speaker="combined",
-            file_url=str(final_audio)
+            file_url=str(final_audio),
+            audio_data=audio_bytes
         )
 
         db.add(new_audio)
@@ -724,21 +758,40 @@ def get_podcast_audio(
             "error": "Audio not found"
         }
 
-    audio_path = Path(
-        audio.file_url
-    )
+    # Preferred path: serve the persistent database copy.
+    if audio.audio_data:
+        return Response(
+            content=audio.audio_data,
+            media_type="audio/wav",
+            headers={
+                "Content-Disposition": (
+                    f'inline; filename="podcast_{podcast_id}_final.wav"'
+                )
+            },
+        )
 
-    if not audio_path.exists():
+    # Backward-compatible fallback for older records. If the local file
+    # still exists, persist it before returning it.
+    audio_path = Path(audio.file_url)
 
-        return {
-            "error": "Audio file does not exist"
-        }
+    if audio_path.exists():
+        audio_bytes = audio_path.read_bytes()
+        audio.audio_data = audio_bytes
+        db.commit()
 
-    return FileResponse(
-        path=audio_path,
-        media_type="audio/wav",
-        filename=audio_path.name
-    )
+        return Response(
+            content=audio_bytes,
+            media_type="audio/wav",
+            headers={
+                "Content-Disposition": (
+                    f'inline; filename="{audio_path.name}"'
+                )
+            },
+        )
+
+    return {
+        "error": "Audio file is not available. Please regenerate this podcast once."
+    }
 
 @app.delete("/podcasts/{podcast_id}")
 def delete_podcast(

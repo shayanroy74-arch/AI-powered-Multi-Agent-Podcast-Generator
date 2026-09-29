@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Text, DateTime, ForeignKey, func
+from sqlalchemy import Column, Integer, String, Text, DateTime, ForeignKey, LargeBinary, func
 from sqlalchemy.orm import relationship
 
 from backend.database import Base
@@ -87,6 +87,7 @@ class AudioFile(Base):
     podcast_id = Column(Integer, ForeignKey("podcasts.id"), nullable=False)
     speaker = Column(String, nullable=True)
     file_url = Column(Text, nullable=False)
+    audio_data = Column(LargeBinary, nullable=True)
     created_at = Column(DateTime, nullable=True)
 
     podcast = relationship("Podcast", back_populates="audio_files")
