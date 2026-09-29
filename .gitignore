@@ -1,18 +1,37 @@
+# =========================
 # Python
+# =========================
 venv/
 __pycache__/
 *.py[cod]
 
+# =========================
 # Environment variables
+# =========================
 .env
 .env.*
+!.env.example
 
+# =========================
 # React / Vite
+# =========================
 frontend/node_modules/
 frontend/dist/
 
+# =========================
 # VS Code
+# =========================
 .vscode/
 
+# =========================
 # Generated podcast audio
-audio/generated/
+# =========================
+backend/generated_audio/
+*.wav
+*.mp3
+
+# =========================
+# OS files
+# =========================
+.DS_Store
+Thumbs.db
