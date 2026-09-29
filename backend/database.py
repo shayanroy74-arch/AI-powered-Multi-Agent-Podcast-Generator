@@ -11,7 +11,6 @@ from sqlalchemy.orm import sessionmaker, declarative_base
 # ============================================================
 
 BASE_DIR = Path(__file__).resolve().parent
-
 load_dotenv(BASE_DIR / ".env")
 
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -25,24 +24,20 @@ if not DATABASE_URL:
 # ============================================================
 # DATABASE ENGINE
 # ============================================================
+# Render/PostgreSQL connections can occasionally be closed while idle.
+# These settings make SQLAlchemy validate pooled connections and recycle
+# them periodically instead of reusing a stale connection.
 
 engine = create_engine(
     DATABASE_URL,
-
-    # Check that a pooled connection is still alive
-    # before SQLAlchemy gives it to the application.
     pool_pre_ping=True,
-
-    # Recycle connections periodically instead of keeping
-    # them indefinitely.
     pool_recycle=300,
-
-    # Make sure connections are clean when returned to the pool.
+    pool_size=2,
+    max_overflow=1,
+    pool_timeout=30,
     pool_reset_on_return="rollback",
-
-    # PostgreSQL TCP keepalive settings.
-    # These help detect broken network connections.
     connect_args={
+        "connect_timeout": 10,
         "keepalives": 1,
         "keepalives_idle": 30,
         "keepalives_interval": 10,
