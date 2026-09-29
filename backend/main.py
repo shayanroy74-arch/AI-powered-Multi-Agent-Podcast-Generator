@@ -532,20 +532,50 @@ def run_podcast_generation(podcast_id: int):
         final_audio = generate_podcast_audio(final_script, podcast_id)
         audio_bytes = final_audio.read_bytes()
 
-        # --------------------------------------------------------
-        # STEP 8: SAVE AUDIO INFORMATION + AUDIO BYTES
-        # --------------------------------------------------------
-        with SessionLocal() as db:
-            db.add(
-                AudioFile(
-                    podcast_id=podcast_id,
-                    speaker="combined",
-                    file_url=str(final_audio),
-                    audio_data=audio_bytes,
-                )
-            )
-            db.commit()
+        import time
 
+# --------------------------------------------------------
+# STEP 8: SAVE AUDIO INFORMATION + AUDIO BYTES
+# --------------------------------------------------------
+        audio_saved = False
+
+        for attempt in range(3):
+            try:
+                with SessionLocal() as db:
+            # Check whether the audio was already saved.
+                    existing_audio = (
+                        db.query(AudioFile)
+                        .filter(
+                        AudioFile.podcast_id == podcast_id,
+                        AudioFile.speaker == "combined",
+                    )
+                    .first()
+                )
+
+                if not existing_audio:
+                    db.add(
+                    AudioFile(
+                        podcast_id=podcast_id,
+                        speaker="combined",
+                        file_url=str(final_audio),
+                        audio_data=audio_bytes,
+                    )
+                )
+                db.commit()
+
+                audio_saved = True
+                break
+
+            except Exception as audio_error:
+                print(
+                    f"Audio database save attempt {attempt + 1}/3 failed: "
+                    f"{audio_error}"
+                )
+
+            if attempt < 2:
+                time.sleep(5)
+            else:
+                raise
         # --------------------------------------------------------
         # GENERATION COMPLETED
         # --------------------------------------------------------
