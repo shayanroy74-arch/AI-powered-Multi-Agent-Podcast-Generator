@@ -1,0 +1,14 @@
+venv/
+.git/
+.env
+.env.*
+__pycache__/
+*.pyc
+frontend/
+backend/generated_audio/
+*.wav
+*.mp3
+node_modules/
+frontend/dist/
+AI-Multi-Agent-Podcast-Generator/
+*.zip
