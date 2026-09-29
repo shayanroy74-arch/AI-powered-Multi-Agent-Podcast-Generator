@@ -2,7 +2,7 @@ from pathlib import Path
 import time
 import traceback
 
-from fastapi import FastAPI, BackgroundTasks, Request
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, JSONResponse
 from sqlalchemy import text
@@ -657,7 +657,6 @@ def run_podcast_generation(podcast_id: int):
 @app.post("/generate-podcast")
 def generate_podcast(
     request: PodcastGenerationRequest,
-    background_tasks: BackgroundTasks,
 ):
     def operation(db):
         podcast = (
@@ -701,19 +700,14 @@ def generate_podcast(
     if result is None:
         return {"error": "Podcast not found"}
 
-    if result.pop("queue", False):
-        background_tasks.add_task(
-            run_podcast_generation,
-            result["podcast_id"],
-        )
-
+    # The Render background worker picks up podcasts with
+    # status="generating" from PostgreSQL.
     return result
 
 
 @app.post("/podcasts/{podcast_id}/regenerate")
 def regenerate_podcast(
     podcast_id: int,
-    background_tasks: BackgroundTasks,
 ):
     def operation(db):
         podcast = (
@@ -748,12 +742,8 @@ def regenerate_podcast(
     if result is None:
         return {"error": "Podcast not found"}
 
-    if result.pop("queue", False):
-        background_tasks.add_task(
-            run_podcast_generation,
-            podcast_id,
-        )
-
+    # The Render background worker picks up podcasts with
+    # status="generating" from PostgreSQL.
     return result
 
 
